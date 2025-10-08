@@ -1,25 +1,67 @@
-name: CI
+name: CI & Deploy (Standalone)
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  APP_NAME: truly-medical-pole-a0cabrcfhedhbech
+  NODE_VERSION: "20.x"
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run test
-      - run: npm run build
-        env:
-          OKTA_ORG_URL: https://example.okta.com
-          OKTA_API_TOKEN: test-token
-          NEXT_PUBLIC_APP_NAME: OrgContact
+
+      - name: Install deps (clean)
+        run: npm ci
+
+      - name: Build (Next.js standalone)
+        run: npm run build
+
+      - name: Prepare bundle
+        run: |
+          set -euo pipefail
+          rm -rf out_bundle
+          mkdir -p out_bundle
+          cp -r .next/standalone out_bundle/standalone
+          cp -r .next/static out_bundle/static
+          if [ -d public ]; then cp -r public out_bundle/public; fi
+          cp package.json out_bundle/package.json
+          # Convenience startup shim (in case Azure ignores Startup Command)
+          printf '%s\n' 'node standalone/server.js' > out_bundle/hosting.start.cmd
+          chmod +x out_bundle/hosting.start.cmd
+          echo "Bundle contents:"
+          find out_bundle -maxdepth 2 -type d -print
+
+      # --- Deployment (simple): publish profile secret ---
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.APP_NAME }}
+          package: out_bundle
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE }}
+
+      # If you prefer OIDC (no publish profile), comment the step above and use:
+      # - name: Azure login (OIDC)
+      #   uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      #
+      # - name: Deploy to Azure Web App (OIDC)
+      #   uses: azure/webapps-deploy@v3
+      #   with:
+      #     app-name: ${{ env.APP_NAME }}
+      #     package: out_bundle
