@@ -1,3 +1,7 @@
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+import { unstable_noStore as noStore } from "next/cache";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
@@ -6,6 +10,7 @@ import { fetchUserById } from "../../../lib/okta/client";
 import { formatDisplay } from "../../../lib/utils";
 
 export default async function UserDetailsPage({ params }: { params: { id: string } }) {
+  noStore();
   const user = await fetchUserById(params.id);
   if (!user) {
     notFound();
