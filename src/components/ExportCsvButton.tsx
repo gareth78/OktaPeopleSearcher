@@ -2,39 +2,85 @@
 
 import { useState } from "react";
 
+import type { User } from "../lib/okta/normalize";
+
 import { Button } from "./ui/button";
 
 type ExportCsvButtonProps = {
-  query: string;
-  departments: string[];
-  location: string | null;
-  sort: "name" | "department" | "location";
-  direction: "asc" | "desc";
+  users: User[];
+  disabled?: boolean;
 };
 
-export function ExportCsvButton({ query, departments, location, sort, direction }: ExportCsvButtonProps) {
+const HEADER = [
+  "id",
+  "displayName",
+  "firstName",
+  "lastName",
+  "email",
+  "secondEmail",
+  "mobilePhone",
+  "department",
+  "title",
+  "organization",
+  "costCenter",
+  "city",
+  "state",
+  "zipCode",
+  "countryCode",
+  "location",
+  "status",
+];
+
+function escapeValue(value: string | null | undefined) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  const trimmed = value.toString();
+  const needsQuotes = /[",\n]/.test(trimmed);
+  const sanitized = trimmed.replace(/"/g, '""');
+  return needsQuotes ? `"${sanitized}"` : sanitized;
+}
+
+function buildCsv(users: User[]) {
+  const rows = [HEADER.join(",")];
+  for (const user of users) {
+    const row = [
+      user.id,
+      user.displayName,
+      user.firstName,
+      user.lastName,
+      user.email,
+      user.secondEmail,
+      user.mobilePhone,
+      user.department,
+      user.title,
+      user.organization,
+      user.costCenter,
+      user.city,
+      user.state,
+      user.zipCode,
+      user.countryCode,
+      user.location,
+      user.status,
+    ]
+      .map((value) => escapeValue(value))
+      .join(",");
+    rows.push(row);
+  }
+  return rows.join("\n");
+}
+
+export function ExportCsvButton({ users, disabled }: ExportCsvButtonProps) {
   const [isExporting, setIsExporting] = useState(false);
 
   async function handleExport() {
+    if (!users.length) {
+      return;
+    }
     setIsExporting(true);
     try {
-      const response = await fetch("/api/users", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          query: query || undefined,
-          departments: departments.length > 0 ? departments : undefined,
-          location: location || undefined,
-          sort,
-          direction,
-        }),
-      });
-      if (!response.ok) {
-        throw new Error("Failed to export");
-      }
-      const blob = await response.blob();
+      const csv = buildCsv(users);
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -52,7 +98,7 @@ export function ExportCsvButton({ query, departments, location, sort, direction 
   }
 
   return (
-    <Button variant="outline" onClick={handleExport} disabled={isExporting}>
+    <Button variant="outline" onClick={handleExport} disabled={disabled || isExporting}>
       {isExporting ? "Preparing CSV…" : "Export CSV"}
     </Button>
   );
