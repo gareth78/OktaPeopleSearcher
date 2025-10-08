@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - OKTA_ORG_URL=${OKTA_ORG_URL}
+      - OKTA_API_TOKEN=${OKTA_API_TOKEN}
+      - NEXT_PUBLIC_APP_NAME=${NEXT_PUBLIC_APP_NAME:-OrgContact}
+    env_file:
+      - .env.local
+    command: npm run start
