@@ -52,11 +52,13 @@ describe("Okta client", () => {
 
     globalThis.fetch = mockFetch as unknown as typeof globalThis.fetch;
     const { fetchUsers } = await import("../src/lib/okta/client");
-    const result = await fetchUsers({ limit: 1 });
+    const result = (await fetchUsers({ limit: 1 })) as Array<{
+      profile?: { firstName?: string };
+    }> & { nextCursor?: string };
 
     expect(Array.isArray(result)).toBe(true);
-    expect((result as any).nextCursor).toBe("abc");
-    expect((result as any)[0].profile.firstName).toBe("Ada");
+    expect(result.nextCursor).toBe("abc");
+    expect(result[0]?.profile?.firstName).toBe("Ada");
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
