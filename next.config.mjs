@@ -1,11 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: {
-    optimizePackageImports: ["lucide-react"],
-  },
   output: "standalone",
-  staticPageGenerationTimeout: 120,
-  reactStrictMode: true,
+  // keep your existing settings (e.g., staticPageGenerationTimeout, etc.)
 };
-
 export default nextConfig;
