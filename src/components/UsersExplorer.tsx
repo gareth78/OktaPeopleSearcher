@@ -1,13 +1,12 @@
 "use client";
 
 import { LayoutGrid, ListOrdered } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 
-import type { User } from "../lib/okta/normalize";
+import { normalizeUser, type OktaUser, type User } from "../lib/okta/normalize";
 
 import { ExportCsvButton } from "./ExportCsvButton";
 import { Filters } from "./Filters";
-import { Pagination } from "./Pagination";
 import { SearchBar } from "./SearchBar";
 import { Button } from "./ui/button";
 import {
@@ -21,17 +20,90 @@ import {
 import { UserCard } from "./UserCard";
 import { UserList } from "./UserList";
 
-const PAGE_SIZE = 25;
+const FETCH_LIMIT = 200;
 
-type SortOption = "name" | "department" | "location";
 type DirectionOption = "asc" | "desc";
+type SortOption = "name" | "department" | "location";
 
 type UsersResponse = {
-  total: number;
-  users: User[];
-  nextCursor?: number;
-  limit: number;
+  ok: boolean;
+  data: unknown;
+  error?: string;
 };
+
+function toComparable(value: string | null | undefined) {
+  return value?.toLowerCase() ?? "";
+}
+
+function sortUsers(users: User[], sort: SortOption, direction: DirectionOption) {
+  const modifier = direction === "asc" ? 1 : -1;
+  const keySelector: Record<SortOption, (user: User) => string> = {
+    name: (user) => toComparable(user.displayName || user.firstName || user.lastName),
+    department: (user) => toComparable(user.department),
+    location: (user) => toComparable(user.location),
+  };
+  const select = keySelector[sort];
+  return [...users].sort((a, b) => {
+    const aKey = select(a);
+    const bKey = select(b);
+    if (aKey === bKey) {
+      return a.displayName.localeCompare(b.displayName) * modifier;
+    }
+    return aKey.localeCompare(bKey) * modifier;
+  });
+}
+
+function matchesQuery(user: User, query: string | undefined) {
+  if (!query) {
+    return true;
+  }
+  const term = query.toLowerCase();
+  const fields = [
+    user.displayName,
+    `${user.firstName} ${user.lastName}`,
+    user.email,
+    user.secondEmail,
+    user.mobilePhone,
+  ];
+  return fields.some((field) => field?.toLowerCase().includes(term));
+}
+
+function matchesFilters(user: User, departmentSet?: Set<string>, location?: string | null) {
+  const normalizedLocation = location?.toLowerCase();
+  if (departmentSet && departmentSet.size > 0) {
+    if (!user.department) {
+      return false;
+    }
+    const normalized = user.department.toLowerCase();
+    if (!departmentSet.has(normalized)) {
+      return false;
+    }
+  }
+  if (normalizedLocation) {
+    if (!user.location) {
+      return false;
+    }
+    if (user.location.toLowerCase() !== normalizedLocation) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function normalizeUsers(payload: unknown): User[] {
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+  const result: User[] = [];
+  for (const entry of payload) {
+    try {
+      result.push(normalizeUser(entry as OktaUser));
+    } catch (error) {
+      console.warn("Failed to normalize Okta user", error);
+    }
+  }
+  return result;
+}
 
 export function UsersExplorer() {
   const appName = process.env.NEXT_PUBLIC_APP_NAME ?? "OrgContact";
@@ -43,23 +115,23 @@ export function UsersExplorer() {
   const [selectedLocation, setSelectedLocation] = useState<string | null>(null);
   const [sort, setSort] = useState<SortOption>("name");
   const [direction, setDirection] = useState<DirectionOption>("asc");
-  const [offset, setOffset] = useState(0);
-  const [data, setData] = useState<UsersResponse | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isPending, startTransition] = useTransition();
   const [view, setView] = useState<"list" | "grid">("list");
-  const prefetchedPages = useRef(new Map<number, UsersResponse>());
 
   useEffect(() => {
     async function loadFilters() {
       try {
         const [departmentsResponse, locationsResponse] = await Promise.all([
-          fetch("/api/departments").then((res) => res.json()),
-          fetch("/api/locations").then((res) => res.json()),
+          fetch("/api/departments", { cache: "no-store" }).then((res) => res.json()),
+          fetch("/api/locations", { cache: "no-store" }).then((res) => res.json()),
         ]);
-        setDepartments(departmentsResponse.departments ?? []);
-        setLocations(locationsResponse.locations ?? []);
+        const deptPayload = departmentsResponse as UsersResponse;
+        const locPayload = locationsResponse as UsersResponse;
+        setDepartments(Array.isArray(deptPayload.data) ? (deptPayload.data as string[]) : []);
+        setLocations(Array.isArray(locPayload.data) ? (locPayload.data as string[]) : []);
       } catch (fetchError) {
         console.error("Failed to load filters", fetchError);
       }
@@ -71,56 +143,30 @@ export function UsersExplorer() {
     setPendingQuery(query);
   }, [query]);
 
-  const searchParams = useMemo(() => {
-    const params = new URLSearchParams();
-    if (query.trim()) params.set("query", query.trim());
-    selectedDepartments.forEach((department) => params.append("department", department));
-    if (selectedLocation) params.set("location", selectedLocation);
-    params.set("limit", String(PAGE_SIZE));
-    params.set("cursor", String(offset));
-    params.set("sort", sort);
-    params.set("direction", direction);
-    return params;
-  }, [query, selectedDepartments, selectedLocation, offset, sort, direction]);
-
-  async function fetchUsers(params: URLSearchParams) {
-    const response = await fetch(`/api/users?${params.toString()}`);
-    if (!response.ok) {
-      if (response.status === 429) {
-        throw new Error("OrgContact is busy. Please try again shortly.");
-      }
-      const payload = await response.json().catch(() => null);
-      throw new Error(payload?.error ?? "Unable to load people right now.");
-    }
-    return (await response.json()) as UsersResponse;
-  }
-
   useEffect(() => {
     let isCancelled = false;
     async function loadUsers() {
       try {
-        setError(null);
         setIsLoading(true);
-        const result = prefetchedPages.current.get(offset) ?? (await fetchUsers(searchParams));
-        if (isCancelled) return;
-        prefetchedPages.current.delete(offset);
-        setData(result);
-        const { nextCursor } = result;
-        if (typeof nextCursor === "number") {
-          const nextParams = new URLSearchParams(searchParams);
-          nextParams.set("cursor", String(nextCursor));
-          fetchUsers(nextParams)
-            .then((nextPage) => {
-              prefetchedPages.current.set(nextCursor, nextPage);
-            })
-            .catch(() => {
-              /* ignore prefetch errors */
-            });
+        setError(null);
+        const response = await fetch(`/api/users?limit=${FETCH_LIMIT}`, { cache: "no-store" });
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => null)) as UsersResponse | null;
+          throw new Error(payload?.error || "Unable to load people right now.");
+        }
+        const payload = (await response.json()) as UsersResponse;
+        if (!payload.ok) {
+          throw new Error(payload.error || "Unable to load people right now.");
+        }
+        const normalized = normalizeUsers(payload.data);
+        if (!isCancelled) {
+          setUsers(normalized);
         }
       } catch (loadError) {
-        if (isCancelled) return;
-        setError(loadError instanceof Error ? loadError.message : "Unable to load people");
-        setData(null);
+        if (!isCancelled) {
+          setError(loadError instanceof Error ? loadError.message : "Unable to load people");
+          setUsers([]);
+        }
       } finally {
         if (!isCancelled) {
           setIsLoading(false);
@@ -131,25 +177,37 @@ export function UsersExplorer() {
     return () => {
       isCancelled = true;
     };
-  }, [searchParams, offset]);
+  }, []);
+
+  const filteredUsers = useMemo(() => {
+    const departmentSet =
+      selectedDepartments.length > 0
+        ? new Set(selectedDepartments.map((value) => value.toLowerCase()))
+        : undefined;
+    const normalizedLocation = selectedLocation ? selectedLocation.toLowerCase() : null;
+    return users.filter(
+      (user) => matchesQuery(user, query) && matchesFilters(user, departmentSet, normalizedLocation)
+    );
+  }, [query, selectedDepartments, selectedLocation, users]);
+
+  const sortedUsers = useMemo(() => sortUsers(filteredUsers, sort, direction), [
+    filteredUsers,
+    sort,
+    direction,
+  ]);
 
   function handleSearchSubmit() {
     startTransition(() => {
       setQuery(pendingQuery.trim());
-      setOffset(0);
-      prefetchedPages.current.clear();
     });
   }
 
   function handleApplyFilters(newDepartments: string[], newLocation: string | null) {
     setSelectedDepartments(newDepartments);
     setSelectedLocation(newLocation);
-    setOffset(0);
-    prefetchedPages.current.clear();
   }
 
-  const total = data?.total ?? 0;
-  const users = data?.users ?? [];
+  const total = sortedUsers.length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -182,8 +240,6 @@ export function UsersExplorer() {
             value={sort}
             onValueChange={(value) => {
               setSort(value as SortOption);
-              setOffset(0);
-              prefetchedPages.current.clear();
             }}
           >
             <SelectTrigger className="w-[180px]">
@@ -201,8 +257,6 @@ export function UsersExplorer() {
             value={direction}
             onValueChange={(value) => {
               setDirection(value as DirectionOption);
-              setOffset(0);
-              prefetchedPages.current.clear();
             }}
           >
             <SelectTrigger className="w-[140px]">
@@ -217,79 +271,45 @@ export function UsersExplorer() {
           </Select>
         </div>
         <div className="flex items-center gap-2">
-          <ExportCsvButton
-            query={query}
-            departments={selectedDepartments}
-            location={selectedLocation}
-            sort={sort}
-            direction={direction}
-          />
-          <div className="flex items-center gap-1 rounded-md border border-border bg-white p-1">
-            <Button
-              type="button"
-              variant={view === "list" ? "default" : "ghost"}
-              size="icon"
-              onClick={() => setView("list")}
-              aria-label="List view"
-            >
-              <ListOrdered className="h-4 w-4" />
-            </Button>
-            <Button
-              type="button"
-              variant={view === "grid" ? "default" : "ghost"}
-              size="icon"
-              onClick={() => setView("grid")}
-              aria-label="Grid view"
-            >
-              <LayoutGrid className="h-4 w-4" />
-            </Button>
-          </div>
+          <Button
+            variant={view === "list" ? "default" : "outline"}
+            onClick={() => setView("list")}
+            className="flex items-center gap-2"
+          >
+            <ListOrdered className="h-4 w-4" /> List view
+          </Button>
+          <Button
+            variant={view === "grid" ? "default" : "outline"}
+            onClick={() => setView("grid")}
+            className="flex items-center gap-2"
+          >
+            <LayoutGrid className="h-4 w-4" /> Grid view
+          </Button>
+          <ExportCsvButton users={sortedUsers} disabled={sortedUsers.length === 0} />
         </div>
       </div>
 
-      {error && (
-        <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-          {error}
-        </div>
+      {error && <p className="bg-destructive/10 text-destructive rounded-md p-3">{error}</p>}
+
+      {!error && isLoading && <p className="text-muted-foreground">Loading people…</p>}
+
+      {!error && !isLoading && total === 0 && (
+        <p className="text-muted-foreground">No people matched your filters.</p>
       )}
 
-      {isLoading && !error && !data && (
-        <div className="rounded-md border border-border bg-white p-4 text-sm text-muted-foreground">
-          Loading people…
-        </div>
-      )}
-
-      {!error && !isLoading && users.length === 0 && (
-        <div className="rounded-md border border-border bg-white p-6 text-center text-muted-foreground">
-          {query || selectedDepartments.length > 0 || selectedLocation
-            ? "No results match your filters yet."
-            : "No people yet."}
-        </div>
-      )}
-
-      {!error && users.length > 0 && (
-        <div>
-          {view === "grid" ? (
-            <div className="grid gap-4 sm:grid-cols-2">
-              {users.map((user) => (
+      {!error && !isLoading && total > 0 && (
+        <div className="flex flex-col gap-6">
+          <p className="text-sm text-muted-foreground">Showing {total} people.</p>
+          {view === "list" ? (
+            <UserList users={sortedUsers} />
+          ) : (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+              {sortedUsers.map((user) => (
                 <UserCard key={user.id} user={user} />
               ))}
             </div>
-          ) : (
-            <UserList users={users} />
           )}
         </div>
-      )}
-
-      {!error && data && (
-        <Pagination
-          total={total}
-          limit={PAGE_SIZE}
-          offset={offset}
-          onOffsetChange={(newOffset) => {
-            setOffset(newOffset);
-          }}
-        />
       )}
     </div>
   );
