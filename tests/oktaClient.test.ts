@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { clearCache } from "../src/lib/cache/memo";
+
 const originalFetch = globalThis.fetch;
 
 vi.mock("server-only", () => ({}));
@@ -7,18 +9,14 @@ vi.mock("server-only", () => ({}));
 const okResponse = (data: unknown, headers?: Record<string, string>) => ({
   ok: true,
   status: 200,
-  statusText: "OK",
   json: async () => data,
-  text: async () => JSON.stringify(data),
   headers: new Headers(headers),
 });
 
 const errorResponse = (status: number, headers?: Record<string, string>) => ({
   ok: false,
   status,
-  statusText: "Error",
   json: async () => ({}),
-  text: async () => "",
   headers: new Headers(headers),
 });
 
@@ -26,15 +24,16 @@ beforeEach(() => {
   vi.resetModules();
   process.env.OKTA_ORG_URL = "https://example.okta.com";
   process.env.OKTA_API_TOKEN = "token";
+  clearCache();
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
   vi.useRealTimers();
+  globalThis.fetch = originalFetch;
 });
 
 describe("Okta client", () => {
-  it("attaches next cursor metadata when available", async () => {
+  it("parses pagination cursor from link header", async () => {
     const mockFetch = vi
       .fn()
       .mockResolvedValue(
@@ -51,18 +50,15 @@ describe("Okta client", () => {
       );
 
     globalThis.fetch = mockFetch as unknown as typeof globalThis.fetch;
-    const { fetchUsers } = await import("../src/lib/okta/client");
-    const result = (await fetchUsers({ limit: 1 })) as Array<{
-      profile?: { firstName?: string };
-    }> & { nextCursor?: string };
+    const { listUsers } = await import("../src/lib/okta/client");
+    const result = await listUsers({ limit: 1 });
 
-    expect(Array.isArray(result)).toBe(true);
+    expect(result.users[0].displayName).toBe("Ada Lovelace");
     expect(result.nextCursor).toBe("abc");
-    expect(result[0]?.profile?.firstName).toBe("Ada");
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("retries once when Okta responds with rate limiting", async () => {
+  it("retries when Okta responds with rate limiting", async () => {
     vi.useFakeTimers();
     const mockFetch = vi
       .fn()
@@ -78,23 +74,12 @@ describe("Okta client", () => {
       );
 
     globalThis.fetch = mockFetch as unknown as typeof globalThis.fetch;
-    const { fetchUsers } = await import("../src/lib/okta/client");
-    const promise = fetchUsers({ limit: 1 });
+    const { listUsers } = await import("../src/lib/okta/client");
+    const promise = listUsers({ limit: 1 });
     await vi.runAllTimersAsync();
     const result = await promise;
 
-    expect(Array.isArray(result)).toBe(true);
+    expect(result.users).toHaveLength(1);
     expect(mockFetch).toHaveBeenCalledTimes(2);
-  });
-
-  it("returns null when a user is not found", async () => {
-    const mockFetch = vi.fn().mockResolvedValue(errorResponse(404));
-    globalThis.fetch = mockFetch as unknown as typeof globalThis.fetch;
-
-    const { fetchUserById } = await import("../src/lib/okta/client");
-    const user = await fetchUserById("missing");
-
-    expect(user).toBeNull();
-    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

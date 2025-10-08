@@ -1,174 +1,178 @@
 import "server-only";
 
-import { normalizeUser, type User } from "./normalize";
+import { memoizeWithTtl } from "../cache/memo";
 
-type OktaConfig = { base: string; token: string };
+import { normalizeUser, type OktaUser, type User } from "./normalize";
 
-let cachedConfig: OktaConfig | null = null;
+const OKTA_ORG_URL = process.env.OKTA_ORG_URL;
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN;
 
-function getOktaConfig(): OktaConfig {
-  if (cachedConfig) {
-    return cachedConfig;
-  }
-  const base = (process.env.OKTA_ORG_URL || "").replace(/\/+$/, "");
-  const token = process.env.OKTA_API_TOKEN;
-  if (!base || !token) {
-    throw new Error("Missing OKTA_ORG_URL / OKTA_API_TOKEN");
-  }
-  cachedConfig = { base, token };
-  return cachedConfig;
+const DEFAULT_TIMEOUT_MS = 10000;
+const MAX_ATTEMPTS = 4;
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+if (!OKTA_ORG_URL) {
+  console.warn("OKTA_ORG_URL is not configured. API routes will return empty results.");
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal, cache: "no-store" });
-  } finally {
-    clearTimeout(t);
+if (!OKTA_API_TOKEN) {
+  console.warn("OKTA_API_TOKEN is not configured. API routes will return empty results.");
+}
+
+type FetchOptions = RequestInit & { timeoutMs?: number };
+
+type PaginatedResult = {
+  users: User[];
+  nextCursor?: string;
+};
+
+function buildUrl(path: string, searchParams?: URLSearchParams) {
+  if (!OKTA_ORG_URL) {
+    throw new Error("Missing Okta configuration");
   }
+  const url = new URL(path, OKTA_ORG_URL);
+  if (searchParams) {
+    url.search = searchParams.toString();
+  }
+  return url.toString();
 }
 
-function shouldRetry(status: number) {
-  return status === 429 || (status >= 500 && status < 600);
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type RetryOpts = { maxRetries?: number; initialDelayMs?: number; timeoutMs?: number };
-
-type AugmentedError = Error & { __oktaDontRetry?: boolean };
-
-async function rawOktaRequest(path: string, opts: RetryOpts = {}) {
-  const { maxRetries = 1, initialDelayMs = 400, timeoutMs = 8000 } = opts;
-  let attempt = 0,
-    delay = initialDelayMs,
-    lastErr: unknown = null;
-
-  while (attempt <= maxRetries) {
-    try {
-      const { base, token } = getOktaConfig();
-      const res = await fetchWithTimeout(
-        `${base}${path}`,
-        {
-          headers: { Authorization: `SSWS ${token}` },
-        },
-        timeoutMs
-      );
-
-      if (!res.ok) {
-        if (shouldRetry(res.status) && attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, delay + Math.floor(Math.random() * 200)));
-          attempt += 1;
-          delay *= 2;
-          continue;
-        }
-        const txt = await res.text().catch(() => "");
-        const error: AugmentedError = new Error(
-          `Okta ${res.status} ${res.statusText} ${txt.slice(0, 200)}`
-        );
-        error.__oktaDontRetry = true;
-        throw error;
-      }
-      return res;
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") {
-        if (attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, delay));
-          attempt += 1;
-          delay *= 2;
-          continue;
-        }
-        lastErr = new Error("Okta request timed out");
-        break;
-      }
-      if (err instanceof Error && (err as AugmentedError).__oktaDontRetry) {
-        lastErr = err;
-        break;
-      }
-      lastErr = err;
-      if (attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, delay));
-        attempt += 1;
-        delay *= 2;
-        continue;
-      }
-      break;
+function computeBackoff(attempt: number, retryAfterHeader?: string | null) {
+  if (retryAfterHeader) {
+    const parsed = Number(retryAfterHeader);
+    if (!Number.isNaN(parsed) && parsed > 0) {
+      return parsed * 1000;
     }
   }
-  if (lastErr instanceof Error) {
-    throw lastErr;
+  const base = 500 * 2 ** attempt;
+  const jitter = Math.floor(Math.random() * 200);
+  return Math.min(base + jitter, 5000);
+}
+
+async function oktaFetch(path: string, options: FetchOptions = {}, attempt = 0): Promise<Response> {
+  if (!OKTA_ORG_URL || !OKTA_API_TOKEN) {
+    throw new Error("Okta client not configured");
   }
-  throw new Error(lastErr ? String(lastErr) : "Unknown Okta error");
+
+  const controller = new AbortController();
+  const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(buildUrl(path), {
+      ...options,
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        Authorization: `SSWS ${OKTA_API_TOKEN}`,
+        "Content-Type": "application/json",
+        ...(options.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+
+    if ((response.status === 429 || response.status >= 500) && attempt < MAX_ATTEMPTS - 1) {
+      const wait = computeBackoff(attempt, response.headers.get("retry-after"));
+      await delay(wait);
+      return oktaFetch(path, options, attempt + 1);
+    }
+
+    if (!response.ok) {
+      const error = new Error(`Okta request failed with status ${response.status}`);
+      throw error;
+    }
+
+    return response;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError" && attempt < MAX_ATTEMPTS - 1) {
+      const wait = computeBackoff(attempt);
+      await delay(wait);
+      return oktaFetch(path, options, attempt + 1);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function oktaRequest(path: string, opts: RetryOpts = {}) {
-  const res = await rawOktaRequest(path, opts);
-  return res.json();
-}
-
-function parseNextCursor(linkHeader: string | null) {
-  if (!linkHeader) return undefined;
-  const parts = linkHeader.split(",");
+function parseNextCursorFromLinkHeader(header: string | null): string | undefined {
+  if (!header) {
+    return undefined;
+  }
+  const parts = header.split(",");
   for (const part of parts) {
     const section = part.trim();
-    if (!section.includes('rel="next"')) continue;
+    if (!section.includes("rel=\"next\"")) {
+      continue;
+    }
     const match = section.match(/<([^>]+)>/);
-    if (!match) continue;
-    try {
-      const url = new URL(match[1]);
-      const after = url.searchParams.get("after") ?? url.searchParams.get("cursor");
-      if (after) return after;
-    } catch (error) {
-      console.warn("Failed to parse Okta link header", error);
+    if (!match) {
+      continue;
+    }
+    const url = new URL(match[1]);
+    const after = url.searchParams.get("after") ?? url.searchParams.get("cursor");
+    if (after) {
+      return after;
     }
   }
   return undefined;
 }
 
-export async function fetchUsers({ limit = 25, cursor = "" } = {}) {
-  const qs = new URLSearchParams();
-  qs.set("limit", String(limit));
-  if (cursor) qs.set("after", cursor);
-  const res = await rawOktaRequest(`/api/v1/users?${qs.toString()}`);
-  const data = (await res.json()) as unknown;
-  const list = Array.isArray(data) ? data : [];
-  const withCursor = list as (typeof list & { nextCursor?: string });
-  withCursor.nextCursor = parseNextCursor(res.headers.get("link"));
-  return withCursor;
+async function fetchUsersPage(params: { limit?: number; cursor?: string }): Promise<PaginatedResult> {
+  const limit = Math.max(1, Math.min(params.limit ?? 200, 200));
+  const searchParams = new URLSearchParams({ limit: String(limit) });
+  if (params.cursor) {
+    searchParams.set("after", params.cursor);
+  }
+  const response = await oktaFetch(`/api/v1/users?${searchParams.toString()}`);
+  const data = (await response.json()) as OktaUser[];
+  const nextCursor = parseNextCursorFromLinkHeader(response.headers.get("link"));
+  const users = data.map(normalizeUser);
+  return { users, nextCursor };
 }
 
-export async function fetchDepartments() {
-  const page = await oktaRequest(`/api/v1/users?limit=200`);
-  const set = new Set<string>();
-  for (const u of Array.isArray(page) ? page : []) {
-    const d = u?.profile?.department;
-    if (d) set.add(String(d));
-  }
-  return [...set].sort((a, b) => a.localeCompare(b));
-}
-
-export async function fetchLocations() {
-  const page = await oktaRequest(`/api/v1/users?limit=200`);
-  const set = new Set<string>();
-  for (const u of Array.isArray(page) ? page : []) {
-    const city = u?.profile?.city?.trim();
-    const cc = u?.profile?.countryCode?.trim();
-    const loc = city && cc ? `${city}, ${cc}` : city || cc;
-    if (loc) set.add(loc);
-  }
-  return [...set].sort((a, b) => a.localeCompare(b));
+export async function listUsers(params: { limit?: number; cursor?: string }): Promise<PaginatedResult> {
+  return memoizeWithTtl(
+    `users:${params.cursor ?? "start"}:${params.limit ?? "default"}`,
+    CACHE_TTL_MS,
+    () => fetchUsersPage(params)
+  );
 }
 
 export async function fetchUserById(id: string): Promise<User | null> {
-  try {
-    const data = await oktaRequest(`/api/v1/users/${encodeURIComponent(id)}`);
+  return memoizeWithTtl(`user:${id}`, CACHE_TTL_MS, async () => {
+    const response = await oktaFetch(`/api/v1/users/${id}`);
+    const data = (await response.json()) as OktaUser;
     return normalizeUser(data);
-  } catch (error: unknown) {
-    if (error instanceof Error && error.message.includes("404")) {
+  }).catch((error) => {
+    if (error instanceof Error && /status 404/.test(error.message)) {
       return null;
     }
     throw error;
-  }
+  });
 }
 
-// * TASK should be pulled from the exported env var
-// * Task description should be 'Your actual task description'
+async function fetchAllUsers(): Promise<User[]> {
+  const results: User[] = [];
+  let cursor: string | undefined;
+  do {
+    // Okta pagination uses the "after" cursor header to retrieve the next page.
+    // We iterate until the API indicates there are no more records or we hit a reasonable cap.
+    const { users, nextCursor } = await fetchUsersPage({ cursor, limit: 200 });
+    results.push(...users);
+    cursor = nextCursor;
+  } while (cursor);
+  return results;
+}
+
+export function listAllUsers(): Promise<User[]> {
+  return memoizeWithTtl("users:all", CACHE_TTL_MS, fetchAllUsers);
+}
+
+export function getCacheTtlMs() {
+  return CACHE_TTL_MS;
+}
