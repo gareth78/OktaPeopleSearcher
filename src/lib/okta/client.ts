@@ -65,6 +65,7 @@ async function oktaFetch(path: string, options: FetchOptions = {}, attempt = 0):
   try {
     const response = await fetch(buildUrl(path), {
       ...options,
+      cache: "no-store",
       headers: {
         Accept: "application/json",
         Authorization: `SSWS ${OKTA_API_TOKEN}`,
